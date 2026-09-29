@@ -6,7 +6,7 @@ The **SBX APL Approval Platform** (`SBXAPLApprovalPlatformV7_8_0_0_6.zip`) is an
 
 ### Key Architectural Capabilities
 * **Multi-App Architecture**: Contains 3 Canvas Apps representing the solution's evolution:
-  * `sbxapl_sbxaplapprovalappv7` (Original V7 Canvas App utilizing AutoLayout flex containers).
+  * `sbxapl_sbxaplapprovalappv7` (Original V7 Canvas App - main functioning baseline app utilizing AutoLayout flex containers).
   * `sbxapl_sbxaplapprovalappv8` (V8 Production Release featuring a deterministic ManualLayout home screen `scrHomeV8` with 163 fixed-canvas controls to eliminate layout shift and PA2108 property errors).
   * `sbxapl_sbxaplapprovalplatformv9_fcf0b` (V9 Shell/Prototype introducing Price Tier master data management).
 * **Automated Multi-Tier Approval Engine**: 8 Power Automate cloud flows orchestrating request intake, tier matrix evaluation, parallel and sequential approver task assignment, decision processing, status reconciliation, and custom HTML-based email notifications.
@@ -46,7 +46,7 @@ The solution standardizes all external connector instances across all 3 Canvas A
 |                                                                                                   |
 |   +----------------------------+   +----------------------------+   +-------------------------+   |
 |   | SBX APL Approval App V7    |   | SBX APL Approval App V8    |   | SBX APL Platform V9     |   |
-|   | (Legacy Flex Container UI) |   | (Production ManualLayout)  |   | (Price Tier Admin Shell)|   |
+|   | (Baseline Functioning UI)  |   | (Production ManualLayout)  |   | (Price Tier Admin Shell)|   |
 |   +----------------------------+   +----------------------------+   +-------------------------+   |
 +----------------------------------------------+----------------------------------------------------+
                                                |
@@ -162,26 +162,145 @@ The solution standardizes all external connector instances across all 3 Canvas A
 
 ---
 
-## 6. Canvas Applications Comparison & UX Analysis
+## 6. Deep-Dive Analysis of Main Functioning App: V7 (`sbxapl_sbxaplapprovalappv7`)
 
-### App Version Comparison Matrix
+### 6.1 UI & UX Deficiencies in V7
+1. **Legacy Classic Controls & Hardcoded RGB Color Strings**:
+   * Uses classic Canvas controls (`Classic Button`, `Classic Text Input`, `Classic Dropdown`) with hardcoded RGB style formulas (`RGBA(18, 61, 53, 1)`) scattered across individual control properties instead of centralized Fluent UI theme tokens.
+2. **Layout Shifts & PA2108 Flex Container Property Errors**:
+   * `scrHome` and `scrHome_new` use nested flex container hierarchies. Asynchronous data loading during `OnVisible` causes expression evaluation timing bugs, resulting in layout jumps and container rendering glitches.
+3. **Orphan & Duplicate Screens**:
+   * V7 contains duplicate/unmaintained screens (`scrAPLRequest_UI`, `scrAPLRequest_UI_1`, `scrApprovals_Modern`, `scrApprovals_Modern_1`, `scrHome_new`), inflating the app package size to over 2.2MB and creating maintenance ambiguity.
+4. **Inconsistent Visual Hierarchy & Accessibility Debt**:
+   * 347 missing accessible labels and 347 missing tab index definitions, preventing screen readers and keyboard navigation from functioning properly.
 
-| Feature / Aspect | SBX APL Approval App V7 | SBX APL Approval App V8 | SBX APL Platform V9 |
-| :--- | :--- | :--- | :--- |
-| **App Schema Logical Name** | `sbxapl_sbxaplapprovalappv7` | `sbxapl_sbxaplapprovalappv8` | `sbxapl_sbxaplapprovalplatformv9_fcf0b` |
-| **Primary Home Screen** | `scrHome` / `scrHome_new` | `scrHomeV8` | `scrHomeV9` |
-| **Layout Strategy** | AutoLayout / Flex Containers | Deterministic Fixed-Canvas ManualLayout (Width=1600) | Simplified Shell Layout |
-| **Controls Count on Home** | Dynamic flex controls | 163 explicitly computed controls | 28 controls |
-| **Navigation Mapping** | Points to `scrHome` | Updated 12 Navigate() calls across 8 screens to `scrHomeV8` | Independent prototype |
-| **AppChecker Issues** | 969 total issues | 569 total issues | 99 total issues |
-| **Target Role** | Legacy Production App | Current Production App | Price Tier Admin Module |
+### 6.2 Performance Bottlenecks in V7
+1. **Synchronous Unbatched `App.OnStart` Loading**:
+   * Executes 15 sequential `ClearCollect()` statements on cold launch without `Concurrent()` wrapping:
+     ```powerapps
+     ClearCollect(USERS, APL_User_Credentials);
+     ClearCollect(colAPLTypes, ...);
+     ClearCollect(colGlobalAttachments, ...);
+     ClearCollect(colExchangeRates, APL_EXCHANGE_RATE);
+     ClearCollect(colSupplier, dim_supplier);
+     // ... 10 more sequential collections ...
+     ```
+   * Causes multi-second initial launch delay.
+2. **Client-Side Heavy Collection Duplication**:
+   * Pulls full dataset records from `APL_EXCHANGE_RATE`, `dim_supplier`, and `FMC Articles` into memory instead of querying delegates directly.
+3. **`ForAll()` + `Collect()` / `Patch()` Mutation Anti-Patterns**:
+   * Contains 11 instances of `ForAll()` wrapping database mutation calls in `scrAPLRequest`:
+     ```powerapps
+     ForAll(colItems, Patch(SAVED_APL, Defaults(SAVED_APL), { ... }))
+     ```
+   * Triggers sequential network requests per collection item, freezing the UI thread during save/submit actions.
+4. **Non-Delegatable Query Warnings**:
+   * 33 `app-SuggestRemoteExecutionHint` warnings where `Distinct()`, `Filter()`, and `Search()` operate on unindexed text fields, threatening data truncation beyond the 500/2000 record threshold.
 
-### Architectural Significance of V8 (`scrHomeV8`)
-In canvas app development, container-based flex layouts (`AutoLayout`) can experience PA2108 property resolution errors and unexpected element reflows when complex formulas evaluate asynchronously during startup. V8 solved this by engineering `scrHomeV8` using fixed-canvas pixel absolute positioning (`ManualLayout`). Every one of the 163 controls on `scrHomeV8` uses explicit X/Y/Width/Height values, completely eliminating startup visual reflows while preserving full formula functionality.
+### 6.3 Logic Fragility & Interruption Risks in V7
+1. **Unhandled Power Automate Flow Calls**:
+   * Flow invocations in `scrApprovals`, `scrAPLReview`, and `scrITReview` execute without `IfError()` error handling:
+     ```powerapps
+     SBXAPL_V7_ProcessApprovalDecision.Run(varTaskId, varReqId, User().Email, "Approved", txtComments.Text);
+     Navigate(scrHome);
+     ```
+   * If a network timeout or flow execution error occurs, the user is navigated away without confirmation, leaving the approval task stuck in an indeterminate state.
+2. **Inline HTML Table Construction in Power Fx Formulas**:
+   * Constructs raw HTML string tables inside gallery item formulas using string concatenation:
+     ```powerapps
+     "<tr><td style=\"\"padding:11px 14px;border-bottom:1px solid #edf0f2;...\"\">" & Coalesce(ApproverName, "") & "</td></tr>"
+     ```
+   * Unmaintainable, slow to parse in Canvas memory, and susceptible to syntax breaking when special characters are introduced.
 
 ---
 
-## 7. Security, Access Control & Credential Management
+## 7. Next-Generation V10 Application Blueprint & Specification
+
+To replace V7 with a modern, high-performance, and uninterrupted enterprise application, the **V10 Application** (`sbxapl_sbxaplapprovalappv10`) will be built from the ground up based on the following specifications.
+
+### 7.1 Modern Fluent UI 2 Design Architecture
+1. **Fluent UI 2 Controls**: Standardize 100% of UI elements on modern Fluent controls (`Button`, `Dropdown`, `TextInput`, `Badge`, `Avatar`, `TabList`, `Table`, `InfoButton`).
+2. **Design Tokens & Theme Engine**: Use Microsoft Fluent UI theme objects configured in `App.Theme`:
+   ```powerapps
+   Set(varBrandPrimary, ColorValue("#123D35"));   // SBX Primary Green
+   Set(varBrandAccent, ColorValue("#D9B56D"));    // SBX Gold Accent
+   Set(varBrandBg, ColorValue("#F8FAFC"));        // Surface Background
+   Set(varBrandSurface, ColorValue("#FFFFFF"));   // Card Surface
+   Set(varBrandText, ColorValue("#0F172A"));      // Primary Slate Text
+   ```
+3. **Clean Responsive Container Structure**:
+   * Top Header Bar Container (Logo, App Title, User Profile Avatar, Quick Help).
+   * Sidebar Navigation CommandBar (`TabList` control with active indicator).
+   * Main Dynamic Content Container (Card-based layout with subtle drop shadows and 8px border radiuses).
+
+### 7.2 Uninterrupted Async Logic & Fast-Startup Engine
+1. **Asynchronous Parallel Cold Launch (`App.OnStart`)**:
+   ```powerapps
+   Concurrent(
+       Set(varCurrentUser, User()),
+       Set(varAppLoaded, false),
+       ClearCollect(USERS, APL_User_Credentials),
+       ClearCollect(colExchangeRates, APL_EXCHANGE_RATE)
+   );
+   Set(varAppLoaded, true);
+   ```
+2. **Non-Blocking Flow Execution with `IfError()` Protection**:
+   ```powerapps
+   Set(varIsSubmitting, true);
+   IfError(
+       Set(
+           varFlowResult,
+           SBXAPL_V7_ProcessApprovalDecision.Run(
+               varSelectedTask.ID,
+               varSelectedTask.RequestID,
+               varCurrentUser.Email,
+               varDecision,
+               txtDecisionComments.Text
+           )
+       ),
+       Notify("Failed to submit approval decision. Please check your network connection and try again.", NotificationType.Error),
+       Notify("Decision recorded successfully!", NotificationType.Success);
+       Navigate(scrV10Home, ScreenTransition.Cover)
+   );
+   Set(varIsSubmitting, false);
+   ```
+3. **Optimistic UI State Feedback**:
+   * Instantly update gallery status indicators locally before network completion, providing immediate visual confirmation to the user.
+
+### 7.3 High-Performance Delegatable Data Access Layer
+1. **Direct OData Delegatable Querying**:
+   * Eliminate full table `ClearCollect()` calls; bind galleries directly to delegatable SharePoint filter queries:
+     ```powerapps
+     Filter(
+         Requests,
+         Status.Value = varSelectedTabStatus &&
+         (IsBlank(txtSearch.Text) || StartsWith(Title, txtSearch.Text))
+     )
+     ```
+2. **Server-Side Pagination & Lazy Loading**:
+   * Leverage Power Apps native gallery pagination (pulling batches of 100 items on demand as the user scrolls).
+3. **Batch Updates**:
+   * Replace `ForAll(col, Patch(...))` loops with single JSON payload flow invocations or optimized batch patch calls.
+
+### 7.4 V10 Consolidated Screen Architecture
+
+```
++---------------------------------------------------------------------------------------------------+
+|                                      SBX APL APPROVAL APP V10                                     |
+|                                                                                                   |
+|  [scrV10Home] ----------> Executive Dashboard, Pending Approvals Summary, Quick Launch Cards       |
+|  [scrV10APLForm] -------> Modernized APL Request Creator (Supplier Lookup, Article Price Grid)    |
+|  [scrV10ITForm] --------> Modernized IT Infrastructure Request Form                               |
+|  [scrV10Review] --------> Unified Request View, Dynamic Approval Timeline & Document Preview     |
+|  [scrV10Approvals] -----> Approver Action Hub (Task Review, Decision Modal, Comments)             |
+|  [scrV10SavedDrafts] ---> Draft Management Hub (Resume, Edit, Delete Drafts)                      |
+|  [scrV10Admin] ---------> Master Data Management (Price Tiers, User Roles, Exchange Rates)        |
++---------------------------------------------------------------------------------------------------+
+```
+
+---
+
+## 8. Security, Access Control & Credential Management
 
 * **Authentication & Authorization**: Built on Microsoft 365 Azure AD / Entra ID identity.
 * **Custom Role-Based Access Control (RBAC)**: App startup (`App.OnStart`) fetches permissions from `APL_User_Credentials`:
@@ -195,7 +314,7 @@ In canvas app development, container-based flex layouts (`AutoLayout`) can exper
 
 ---
 
-## 8. Identified Gaps, Technical Debt & Risks
+## 9. Identified Gaps, Technical Debt & Risks
 
 1. **Custom RBAC Storage in SharePoint List (`APL_User_Credentials`)**
    * *Risk*: Users with read access to the SharePoint site can view or bypass frontend visibility restrictions if direct SharePoint access is not locked down via list permissions.
@@ -208,20 +327,24 @@ In canvas app development, container-based flex layouts (`AutoLayout`) can exper
 
 ---
 
-## 9. Strategic Recommendations & Optimization Roadmap
+## 10. Strategic Implementation Roadmap for V10 Migration
 
-### Phase 1: Immediate Maintenance & Hardening (1 - 2 Weeks)
-1. **Environment Variable Strategy**: Replace hardcoded URL string (`varAppShareBaseUrl`) in `App.OnStart` with a Power Platform Environment Variable.
-2. **Delegation Fixes**: Replace non-delegatable Power Fx queries in `scrAPLRequest` and `scrITRequest` with delegatable SharePoint queries or indexed view collections.
-3. **Flow Error Handling**: Add `Configure Run After` blocks in `SBXAPL_V7_ProcessApprovalDecision` and `SBXAPL_V7_SubmitRequest` to catch flow failures and return structured error messages back to Power Apps.
+### Phase 1: V10 Shell Creation & Data Layer Modernization (Weeks 1 - 2)
+1. Initialize clean Canvas App `sbxapl_sbxaplapprovalappv10` in solution package.
+2. Configure Fluent UI 2 theme tokens and responsive header/navigation frame.
+3. Implement `App.OnStart` with parallel `Concurrent()` startup loading.
+4. Replace non-delegatable `ClearCollect` routines with delegatable OData gallery bindings.
 
-### Phase 2: Security & Architecture Modernization (1 - 2 Months)
-1. **Migration to Dataverse or Enhanced Security**: Transition sensitive tables (`Requests`, `APPROVAL`, `APL_User_Credentials`) to Microsoft Dataverse or enforce SharePoint Role-Based Item-Level Security to prevent unauthorized direct list edits.
-2. **Accessibility Remediation**: Batch-update missing `AccessibleLabel` and `TabIndex` properties on interactive controls in `scrHomeV8`, `scrAPLRequest`, and `scrApprovals`.
+### Phase 2: Core Screen Migration & UI Enhancement (Weeks 3 - 4)
+1. Rebuild `scrV10Home` dashboard with modern KPI cards and Fluent `TabList` navigation.
+2. Modernize `scrV10APLForm` and `scrV10ITForm` with auto-calculating price grids, validation badges, and drag-and-drop attachment manager component.
+3. Rebuild `scrV10Approvals` action center with inline decision modals and `IfError()` protected flow calls.
 
-### Phase 3: Solution Consolidation (3 Months)
-1. **App Package Cleanup**: Remove deprecated V7 app (`sbxapl_sbxaplapprovalappv7`) from the solution manifest once V8 adoption is fully validated, reducing solution zip size by ~50%.
-2. **Modularized Component Library**: Extract `cmpAttachmentManager` and `cmpSavedRequestDialog` into a shared Power Platform Component Library for enterprise reuse.
+### Phase 3: Quality Assurance, Security & Production Switchover (Weeks 5 - 6)
+1. Enforce 100% accessibility compliance (AccessibleLabel & TabIndex on all interactive controls).
+2. Configure Environment Variables for tenant URLs and site links.
+3. Conduct end-to-end user acceptance testing (UAT) with Requesters, Approvers, and Admins.
+4. Deprecate legacy V7 app and finalize V10 production release in solution manifest.
 
 ---
-*Report generated automatically following end-to-end extraction, schema inspection, and workflow logic analysis of SBX APL Approval Platform V7/V8/V9.*
+*Report generated automatically following end-to-end extraction, schema inspection, and workflow logic analysis of SBX APL Approval Platform V7/V8/V9/V10.*
